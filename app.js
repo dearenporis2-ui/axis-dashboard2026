@@ -184,6 +184,16 @@ const planFields = (p = {}) => [
   { name: 'included_hours', label: 'Included hours per month', type: 'number', value: p.included_hours },
   { name: 'features', label: 'Features (separate with commas)', value: (p.features || []).join(', ') },
 ];
+async function ensurePlans() {
+  let plans = await list(collection(db, 'plans'));
+  if (!plans.length) {
+    if (me.role !== 'admin') { toast('No plans yet. Ask an admin to add one.'); return []; }
+    toast('No plans yet. Create your first one.');
+    await actions['new-plan']();
+    plans = await list(collection(db, 'plans'));
+  }
+  return plans;
+}
 function planData(id, f) {
   const price = Number(f.price_monthly), hours = Number(f.included_hours);
   if (!(price >= 0) || !(hours >= 0)) { toast('Price and hours must be numbers.'); throw new Error('invalid plan'); }
@@ -203,7 +213,11 @@ const actions = {
     const f = await ask('Edit plan', planFields((await getDoc(ref('plans', el.dataset.id))).data()));
     if (!f) return;
     const data = planData(el.dataset.id, f);
-    await run(() => setDoc(ref('plans', el.dataset.id), data));
+    const linked = await getDocs(query(collection(db, 'client_ops'), where('plan_id', '==', el.dataset.id)));
+    const b = writeBatch(db);
+    b.set(ref('plans', el.dataset.id), data);
+    linked.docs.forEach((d) => b.update(d.ref, { plan_name: data.name, included_hours: data.included_hours, updated_at: now() }));
+    await run(() => b.commit());
   },
   async 'del-plan'(el) {
     if (confirm('Delete this plan? Existing clients keep their records but lose the plan label.')) await run(() => deleteDoc(ref('plans', el.dataset.id)));
@@ -221,8 +235,9 @@ const actions = {
   // Closing = one atomic batch: lead -> Closed, client + client_ops, commission (retainer x rate), rep balance.
   async close(el) {
     const id = el.dataset.id;
-    const [plans, settings, leadSnap] = await Promise.all([list(collection(db, 'plans')), getDoc(ref('settings', 'agency')), getDoc(ref('leads', id))]);
-    if (!plans.length) return toast('Add a maintenance plan first.');
+    const plans = await ensurePlans();
+    if (!plans.length) return;
+    const [settings, leadSnap] = await Promise.all([getDoc(ref('settings', 'agency')), getDoc(ref('leads', id))]);
     const lead = leadSnap.data();
     const f = await ask('Close deal', [
       { name: 'planId', label: 'Maintenance plan', options: plans.map((p) => [p.id, `${p.name} (${scr(p.price_monthly)})`]) },
@@ -278,8 +293,8 @@ const actions = {
   },
 
   async 'new-client'() {
-    const plans = window.__plans || [];
-    if (!plans.length) return toast('Add a maintenance plan first.');
+    const plans = await ensurePlans();
+    if (!plans.length) return;
     const f = await ask('Add client', [{ name: 'company_name', label: 'Company' }, { name: 'contact_person', label: 'Contact person' }, { name: 'email', label: 'Email', type: 'email' },
       { name: 'plan_id', label: 'Plan', options: plans.map((p) => [p.id, p.name]) }, { name: 'retainer_amount', label: 'Monthly retainer (SCR)', type: 'number' }, { name: 'next_renewal_date', label: 'Next renewal', type: 'date' }]);
     if (!f) return;
