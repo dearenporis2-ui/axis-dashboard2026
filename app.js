@@ -300,7 +300,15 @@ $('#login').addEventListener('submit', async (e) => {
   e.preventDefault();
   $('#login-error').textContent = '';
   try { await signInWithEmailAndPassword(auth, $('#email').value, $('#password').value); }
-  catch { $('#login-error').textContent = 'Email or password is incorrect.'; }
+  catch (err) {
+    const code = err.code || '';
+    $('#login-error').textContent =
+      code === 'auth/invalid-credential' || code === 'auth/wrong-password' || code === 'auth/user-not-found' ? 'Email or password is incorrect.'
+      : code === 'auth/api-key-not-valid.-please-pass-a-valid-api-key.' || code === 'auth/invalid-api-key' ? 'Firebase config is missing or wrong. Check firebase-config.js.'
+      : code === 'auth/unauthorized-domain' ? 'This domain is not authorized in Firebase Authentication settings.'
+      : code === 'auth/operation-not-allowed' ? 'Email/Password sign-in is not enabled in Firebase.'
+      : `Sign-in failed (${code || 'unknown error'}).`;
+  }
 });
 $('#signout').addEventListener('click', () => signOut(auth));
 
