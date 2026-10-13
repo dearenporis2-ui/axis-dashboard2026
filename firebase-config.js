@@ -1,7 +1,8 @@
-// Paste your web app config (Firebase console > Project settings > Your apps).
 export const firebaseConfig = {
-  apiKey: 'YOUR_API_KEY',
-  authDomain: 'YOUR_PROJECT.firebaseapp.com',
-  projectId: 'YOUR_PROJECT',
-  appId: 'YOUR_APP_ID',
+  apiKey: 'AIzaSyDwGpwXUXpyh1NunXtC6zDVWCL4sGBpnGk',
+  authDomain: 'axis-dashboard2026.firebaseapp.com',
+  projectId: 'axis-dashboard2026',
+  storageBucket: 'axis-dashboard2026.firebasestorage.app',
+  messagingSenderId: '668443662835',
+  appId: '1:668443662835:web:d30639aadb93b79383da86',
 };
