@@ -45,9 +45,11 @@
 <body>
 <form id="login">
   <div class="brand"><b>AXIS</b><span>Digital Engineering</span></div>
+  <label id="name-row" class="hidden">Name<input id="name" autocomplete="name"></label>
   <label>Email<input id="email" type="email" autocomplete="username" required></label>
   <label>Password<input id="password" type="password" autocomplete="current-password" required></label>
-  <button class="primary">Sign in</button>
+  <button class="primary" id="login-btn">Sign in</button>
+  <button type="button" id="mode-toggle">Create an account</button>
   <p id="login-error" class="muted" role="alert"></p>
 </form>
 
