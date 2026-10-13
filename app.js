@@ -62,11 +62,12 @@ const views = {
   },
 
   async commissions() {
-    const rows = await list(mine('commissions', 'sales_rep_id'));
-    const lead = Object.fromEntries((await list(mine('leads', 'sales_rep_id'))).map((l) => [l.id, l]));
+    const [rows, leadList, meDoc] = await Promise.all([list(mine('commissions', 'sales_rep_id')), list(mine('leads', 'sales_rep_id')),
+      me.role === 'sales_associate' ? getDoc(ref('users', me.uid)) : null]);
+    const lead = Object.fromEntries(leadList.map((l) => [l.id, l]));
     let head = '';
     if (me.role === 'sales_associate') {
-      const u = (await getDoc(doc(db, 'users', me.uid))).data() || {};
+      const u = meDoc.data() || {};
       head = `<div class="stats"><div><b>${scr(u.pending_commission)}</b><span class="muted">Pending</span></div><div><b>${scr(u.total_earned)}</b><span class="muted">Paid out</span></div></div>`;
     }
     $('#main').innerHTML = `<h2>Commissions</h2>${head}<div class="wrap"><table><tr><th>Deal</th><th>Amount</th><th>Status</th><th>Created</th><th></th></tr>${rows.map((c) => `
@@ -75,8 +76,7 @@ const views = {
   },
 
   async plans() {
-    const plans = await list(collection(db, 'plans'));
-    const clients = me.role === 'admin' ? await list(collection(db, 'clients')) : null; // linked clients are billing data: admin only
+    const [plans, clients] = await Promise.all([list(collection(db, 'plans')), me.role === 'admin' ? list(collection(db, 'clients')) : null]); // linked clients are billing data: admin only
     $('#main').innerHTML = `<div class="toolbar"><h2>Maintenance plans</h2>${me.role === 'admin' ? '<button class="primary" data-act="new-plan">Add plan</button>' : ''}</div><div class="cards">${plans.map((p) => `<article class="plan"><h3>${esc(p.name)}</h3>
       <b style="font-size:1.4rem">${scr(p.price_monthly)}<span class="muted" style="display:inline"> / month</span></b><span>${p.included_hours} included hours</span>
       <ul>${(p.features || []).map((f) => `<li>${esc(f)}</li>`).join('')}</ul>
@@ -320,24 +320,29 @@ const actions = {
 document.addEventListener('click', async (e) => {
   const el = e.target.closest('[data-act]');
   if (!el || ['SELECT', 'INPUT'].includes(el.tagName)) return;
-  try { await actions[el.dataset.act](el); await render(); } catch { /* toast already shown */ }
+  if (el.disabled) return;
+  el.disabled = true; // no double-clicks while a write is in flight
+  try { await actions[el.dataset.act](el); await render(); } catch { /* toast already shown */ } finally { el.disabled = false; }
 });
 document.addEventListener('change', async (e) => {
   const el = e.target.closest('[data-act]');
   if (!el) return;
-  try { await actions[el.dataset.act](el); await render(); } catch { await render(); }
+  // The control already shows the new value, so skip the refetch unless the write failed.
+  try { await actions[el.dataset.act](el); if (!['pay-status', 'health', 'set-role'].includes(el.dataset.act)) await render(); } catch { await render(); }
 });
 
 /* ---------------------------------- shell ---------------------------------- */
-async function render() {
+const SKELETON = '<div class="skel" style="width:40%;height:2rem"></div><div class="skel" style="height:8rem;margin-top:1rem"></div><div class="skel" style="height:14rem;margin-top:1rem"></div>';
+async function render(skeleton = false) {
   const allowed = NAV.filter((n) => n[2].includes(me.role));
   const route = location.hash.slice(1);
   const current = allowed.find((n) => n[0] === route) || allowed[0];
   $('#nav').innerHTML = allowed.map((n) => `<a href="#${n[0]}" ${n === current ? 'aria-current="page"' : ''}>${n[1]}</a>`).join('');
+  if (skeleton) $('#main').innerHTML = SKELETON;
   try { await views[current[0]](); }
   catch (e) { console.error(e); $('#main').innerHTML = '<p class="muted">Could not load this page. Check your connection and try again.</p>'; }
 }
-window.addEventListener('hashchange', () => me && render());
+window.addEventListener('hashchange', () => me && render(true));
 
 $('#login').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -410,5 +415,5 @@ onAuthStateChanged(auth, async (user) => {
   $('#who').textContent = me.name; $('#who-email').textContent = me.email;
   $('#role').textContent = ROLE_LABEL[me.role]; $('#role').className = `badge ${me.role}`;
   if (me.role === 'admin') ensureBootstrapMarker();
-  render();
+  render(true);
 });
