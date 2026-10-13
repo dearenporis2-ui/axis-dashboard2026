@@ -1,6 +1,6 @@
 import { firebaseConfig } from './firebase-config.js';
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
-import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, signOut } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
+import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
 import { getFirestore, collection, doc, getDoc, getDocs, query, where, writeBatch, setDoc, updateDoc } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
 
 const app = initializeApp(firebaseConfig);
@@ -110,7 +110,7 @@ views.team = async () => {
   const users = await list(collection(db, 'users'));
   $('#main').innerHTML = `<div class="toolbar"><h2>Team</h2><button class="primary" data-act="new-member">Add team member</button></div>
     <div class="wrap"><table><tr><th>Name</th><th>User ID</th><th>Role</th></tr>${users.map((u) => `<tr><td>${esc(u.name)}<span class="muted">${esc(u.email)}</span></td><td class="muted">${esc(u.id)}</td>
-    <td><select data-act="set-role" data-id="${u.id}">${Object.keys(ROLE_LABEL).map((r) => `<option value="${r}" ${r === u.role ? 'selected' : ''}>${ROLE_LABEL[r]}</option>`).join('')}</select></td></tr>`).join('')}</table></div>`;
+    <td><select data-act="set-role" data-id="${u.id}">${u.role === 'pending' ? '<option value="pending" selected disabled>Pending approval</option>' : ''}${Object.keys(ROLE_LABEL).map((r) => `<option value="${r}" ${r === u.role ? 'selected' : ''}>${ROLE_LABEL[r]}</option>`).join('')}</select></td></tr>`).join('')}</table></div>`;
 };
 
 /* --------------------------------- actions ---------------------------------- */
@@ -299,12 +299,17 @@ window.addEventListener('hashchange', () => me && render());
 $('#login').addEventListener('submit', async (e) => {
   e.preventDefault();
   $('#login-error').textContent = '';
-  try { await signInWithEmailAndPassword(auth, $('#email').value, $('#password').value); }
+  try {
+    if (signupMode) { window.__signupName = $('#name').value; await createUserWithEmailAndPassword(auth, $('#email').value, $('#password').value); }
+    else await signInWithEmailAndPassword(auth, $('#email').value, $('#password').value);
+  }
   catch (err) {
     const code = err.code || '';
     $('#login-error').textContent =
       code === 'auth/invalid-credential' || code === 'auth/wrong-password' || code === 'auth/user-not-found' ? 'Email or password is incorrect.'
       : code === 'auth/api-key-not-valid.-please-pass-a-valid-api-key.' || code === 'auth/invalid-api-key' ? 'Firebase config is missing or wrong. Check firebase-config.js.'
+      : code === 'auth/email-already-in-use' ? 'That email already has an account. Sign in instead.'
+      : code === 'auth/weak-password' ? 'Choose a password with at least 6 characters.'
       : code === 'auth/unauthorized-domain' ? 'This domain is not authorized in Firebase Authentication settings.'
       : code === 'auth/operation-not-allowed' ? 'Email/Password sign-in is not enabled in Firebase.'
       : `Sign-in failed (${code || 'unknown error'}).`;
@@ -312,20 +317,55 @@ $('#login').addEventListener('submit', async (e) => {
 });
 $('#signout').addEventListener('click', () => signOut(auth));
 
+let signupMode = false;
+$('#mode-toggle').addEventListener('click', () => {
+  signupMode = !signupMode;
+  $('#name-row').classList.toggle('hidden', !signupMode);
+  $('#name').required = signupMode;
+  $('#login-btn').textContent = signupMode ? 'Create account' : 'Sign in';
+  $('#mode-toggle').textContent = signupMode ? 'I already have an account' : 'Create an account';
+  $('#login-error').textContent = '';
+});
+
+// First account ever becomes admin (and closes that door with settings/bootstrap).
+// Everyone after that is created as "pending" until an admin assigns a role on the Team page.
+async function createProfile(user) {
+  const base = { id: user.uid, name: (window.__signupName || user.displayName || user.email.split('@')[0]).trim(), email: user.email, pending_commission: 0, total_earned: 0 };
+  const marker = ref('settings', 'bootstrap');
+  const first = !(await getDoc(marker)).exists();
+  if (first) {
+    try {
+      const b = writeBatch(db);
+      b.set(marker, { claimed_by: user.uid, at: now() });
+      b.set(ref('users', user.uid), { ...base, role: 'admin' });
+      await b.commit();
+      return { ...base, role: 'admin' };
+    } catch { /* someone else claimed it first: fall through to pending */ }
+  }
+  await setDoc(ref('users', user.uid), { ...base, role: 'pending' });
+  return { ...base, role: 'pending' };
+}
+// Existing admins close the first-admin door the next time they sign in.
+async function ensureBootstrapMarker() {
+  const marker = ref('settings', 'bootstrap');
+  if (!(await getDoc(marker)).exists()) await setDoc(marker, { claimed_by: me.uid, at: now() }).catch(() => {});
+}
+
 onAuthStateChanged(auth, async (user) => {
   me = null;
   $('#shell').classList.toggle('hidden', !user);
   $('#login').classList.toggle('hidden', !!user);
   if (!user) return;
-  const profile = (await getDoc(ref('users', user.uid))).data();
-  if (!profile || !ROLE_LABEL[profile.role]) {
-    const uid = user.uid;
+  let profile = (await getDoc(ref('users', user.uid))).data();
+  if (!profile) profile = await createProfile(user);
+  if (!ROLE_LABEL[profile.role]) {
     await signOut(auth);
-    $('#login-error').textContent = `No role assigned yet. Send this ID to an admin: ${uid}`;
+    $('#login-error').textContent = 'Account created. An admin has to approve it and assign your role. Try again after they have.';
     return;
   }
   me = { uid: user.uid, name: profile.name || user.email.split('@')[0], email: user.email, role: profile.role };
   $('#who').textContent = me.name; $('#who-email').textContent = me.email;
   $('#role').textContent = ROLE_LABEL[me.role]; $('#role').className = `badge ${me.role}`;
+  if (me.role === 'admin') ensureBootstrapMarker();
   render();
 });
