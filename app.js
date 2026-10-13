@@ -1,7 +1,7 @@
 import { firebaseConfig } from './firebase-config.js';
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
 import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
-import { getFirestore, collection, doc, getDoc, getDocs, query, where, writeBatch, setDoc, updateDoc } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
+import { getFirestore, collection, doc, getDoc, getDocs, query, where, writeBatch, setDoc, updateDoc, deleteDoc } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app), db = getFirestore(app);
@@ -77,10 +77,10 @@ const views = {
   async plans() {
     const plans = await list(collection(db, 'plans'));
     const clients = me.role === 'admin' ? await list(collection(db, 'clients')) : null; // linked clients are billing data: admin only
-    $('#main').innerHTML = `<h2>Maintenance plans</h2><div class="cards">${plans.map((p) => `<article class="plan"><h3>${esc(p.name)}</h3>
+    $('#main').innerHTML = `<div class="toolbar"><h2>Maintenance plans</h2>${me.role === 'admin' ? '<button class="primary" data-act="new-plan">Add plan</button>' : ''}</div><div class="cards">${plans.map((p) => `<article class="plan"><h3>${esc(p.name)}</h3>
       <b style="font-size:1.4rem">${scr(p.price_monthly)}<span class="muted" style="display:inline"> / month</span></b><span>${p.included_hours} included hours</span>
       <ul>${(p.features || []).map((f) => `<li>${esc(f)}</li>`).join('')}</ul>
-      ${clients ? `<span class="muted">${clients.filter((c) => c.plan_id === p.id).map((c) => esc(c.company_name)).join(', ') || 'No linked clients'}</span>` : ''}</article>`).join('') || '<p class="muted">No plans yet. Add documents to the "plans" collection.</p>'}</div>`;
+      ${clients ? `<span class="muted">${clients.filter((c) => c.plan_id === p.id).map((c) => esc(c.company_name)).join(', ') || 'No linked clients'}</span>` : ''}${me.role === 'admin' ? `<div class="row" style="justify-content:flex-start"><button data-act="edit-plan" data-id="${p.id}">Edit</button><button data-act="del-plan" data-id="${p.id}">Delete</button></div>` : ''}</article>`).join('') || '<p class="muted">No plans yet. Admins can create them with the Add plan button.</p>'}</div>`;
   },
 
   async support() {
@@ -178,8 +178,36 @@ async function openDocs(clientId) {
   if (!d.open) d.showModal();
 }
 
+const planFields = (p = {}) => [
+  { name: 'name', label: 'Plan name (e.g. Tier 1: Core)', value: p.name },
+  { name: 'price_monthly', label: 'Price per month (SCR)', type: 'number', value: p.price_monthly },
+  { name: 'included_hours', label: 'Included hours per month', type: 'number', value: p.included_hours },
+  { name: 'features', label: 'Features (separate with commas)', value: (p.features || []).join(', ') },
+];
+function planData(id, f) {
+  const price = Number(f.price_monthly), hours = Number(f.included_hours);
+  if (!(price >= 0) || !(hours >= 0)) { toast('Price and hours must be numbers.'); throw new Error('invalid plan'); }
+  return { id, name: f.name.trim(), price_monthly: price, included_hours: hours, features: f.features.split(',').map((x) => x.trim()).filter(Boolean) };
+}
+
 const actions = {
   async docs(el) { await openDocs(el.dataset.id); },
+  async 'new-plan'() {
+    const f = await ask('Add plan', planFields());
+    if (!f) return;
+    const r = doc(collection(db, 'plans'));
+    const data = planData(r.id, f);
+    await run(() => setDoc(r, data));
+  },
+  async 'edit-plan'(el) {
+    const f = await ask('Edit plan', planFields((await getDoc(ref('plans', el.dataset.id))).data()));
+    if (!f) return;
+    const data = planData(el.dataset.id, f);
+    await run(() => setDoc(ref('plans', el.dataset.id), data));
+  },
+  async 'del-plan'(el) {
+    if (confirm('Delete this plan? Existing clients keep their records but lose the plan label.')) await run(() => deleteDoc(ref('plans', el.dataset.id)));
+  },
   async 'new-lead'() {
     const f = await ask('New lead', [{ name: 'company_name', label: 'Company' }, { name: 'contact_person', label: 'Contact person' }, { name: 'estimated_value', label: 'Estimated value (SCR)', type: 'number' },
       ...(me.role === 'admin' ? [{ name: 'sales_rep_id', label: 'Sales associate user ID' }] : [])]);
