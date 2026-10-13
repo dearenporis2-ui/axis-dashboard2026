@@ -1,0 +1,179 @@
+rules_version = '2';
+
+// AXIS Dashboard – Spark-plan edition (no Cloud Functions, no Admin SDK).
+// Roles live in users/{uid}.role, which only an admin can write.
+// The browser writes directly; these rules enforce who may write what, and
+// getAfter() makes multi-document actions (closing a lead) atomic and checked:
+// a lead can only become Closed together with its client, a correctly
+// calculated commission, and the matching bump to the rep's pending balance.
+//
+//   clients     -> admin only (billing). Sales may only CREATE one while closing their own lead.
+//   client_ops  -> admin + developer (hours, plan name, site health; no money).
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function col(c, id) { return /databases/$(database)/documents/$(c)/$(id); }
+    function role() {
+      return signedIn() && exists(col('users', request.auth.uid))
+        ? get(col('users', request.auth.uid)).data.role : 'none';
+    }
+    function isAdmin() { return role() == 'admin'; }
+    function isSales() { return role() == 'sales_associate'; }
+    function isDev()   { return role() == 'developer'; }
+    function keysOnly(keys) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
+    }
+    function rate() {
+      return exists(col('settings', 'agency'))
+        ? get(col('settings', 'agency')).data.get('commission_rate', 0.1) : 0.1;
+    }
+
+    // ---- users: profile, role, commission balances --------------------------
+    match /users/{userId} {
+      allow read: if signedIn() && (uid() == userId || isAdmin());
+      allow create: if isAdmin();
+      allow update: if isAdmin() || (isSales() && uid() == userId && repBump(userId));
+      allow delete: if false;
+    }
+    // A rep's pending balance may only rise by a commission created in the same batch.
+    function repBump(userId) {
+      let cid = request.resource.data.last_commission_id;
+      let c = col('commissions', cid);
+      return keysOnly(['pending_commission', 'last_commission_id'])
+        && !exists(c) && existsAfter(c)
+        && getAfter(c).data.sales_rep_id == userId
+        && math.abs(request.resource.data.pending_commission
+             - (resource.data.get('pending_commission', 0) + getAfter(c).data.amount)) <= 0.005;
+    }
+
+    // ---- settings (commission rate) & plans: admin writes; sales can read ----
+    match /settings/{id} {
+      allow read: if isAdmin() || isSales();
+      allow write: if isAdmin();
+    }
+    match /plans/{id} {
+      allow read: if isAdmin() || isSales();
+      allow write: if isAdmin();
+    }
+
+    // ---- leads ----------------------------------------------------------------
+    match /leads/{leadId} {
+      allow read: if isAdmin() || (isSales() && resource.data.sales_rep_id == uid());
+      allow create: if isAdmin()
+        || (isSales() && request.resource.data.sales_rep_id == uid() && request.resource.data.status == 'Prospect');
+      allow update: if isAdmin()
+        || (isSales() && resource.data.sales_rep_id == uid() && resource.data.status != 'Closed'
+            && request.resource.data.sales_rep_id == uid() && (openMove() || closeMove()));
+      allow delete: if false;
+    }
+    function openMove() {
+      return keysOnly(['status', 'updated_at'])
+        && request.resource.data.status in ['Prospect', 'Pitch Sent', 'Meeting', 'Lost'];
+    }
+    function closeMove() {
+      return resource.data.status != 'Lost'
+        && request.resource.data.status == 'Closed'
+        && keysOnly(['status', 'closed_at', 'updated_at', 'client_id'])
+        && existsAfter(col('clients', request.resource.data.client_id));
+    }
+
+    // ---- clients (billing) ----------------------------------------------------
+    match /clients/{clientId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() || (isSales() && salesClientOk(clientId));
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+    // Sales may create a client only as part of closing their own lead, at the
+    // plan's listed price (so a rep cannot inflate the retainer to inflate commission).
+    function salesClientOk(clientId) {
+      let c = request.resource.data;
+      let lead = col('leads', c.lead_id);
+      return exists(lead)
+        && get(lead).data.sales_rep_id == uid() && get(lead).data.status != 'Closed'
+        && getAfter(lead).data.status == 'Closed' && getAfter(lead).data.client_id == clientId
+        && c.payment_status == 'Pending' && c.hours_used == 0
+        && c.retainer_amount == get(col('plans', c.plan_id)).data.price_monthly;
+    }
+
+    // ---- client_ops (developer-safe projection) -------------------------------
+    match /client_ops/{opsId} {
+      allow read: if isAdmin() || isDev();
+      allow create: if isAdmin()
+        || (isSales() && !exists(col('clients', opsId)) && existsAfter(col('clients', opsId)));
+      allow update: if isAdmin() || (isDev() && (healthOnly() || hoursOnly(opsId)));
+      allow delete: if false;
+    }
+    function healthOnly() { return keysOnly(['site_health', 'updated_at']); }
+    // Hours may only rise by exactly the hours of a log created in the same batch.
+    function hoursOnly(opsId) {
+      let log = col('maintenance_logs', request.resource.data.last_log_id);
+      return keysOnly(['hours_used', 'last_log_id', 'updated_at'])
+        && !exists(log) && existsAfter(log)
+        && getAfter(log).data.developer_id == uid()
+        && getAfter(log).data.client_id == opsId
+        && request.resource.data.hours_used - resource.data.hours_used == getAfter(log).data.hours_spent;
+    }
+
+    // ---- commissions ----------------------------------------------------------
+    match /commissions/{cid} {
+      allow read: if isAdmin() || (isSales() && resource.data.sales_rep_id == uid());
+      allow create: if isAdmin() || (isSales() && salesCommissionOk(cid));
+      allow update: if isAdmin() && resource.data.status == 'Unpaid'
+        && request.resource.data.status == 'Paid' && keysOnly(['status', 'paid_at']);
+      allow delete: if false;
+    }
+    // id == lead id (one per lead); amount == retainer * rate, checked against the client written in the same batch.
+    function salesCommissionOk(cid) {
+      let c = request.resource.data;
+      let lead = col('leads', cid);
+      let client = col('clients', getAfter(lead).data.client_id);
+      return c.lead_id == cid && c.sales_rep_id == uid() && c.status == 'Unpaid'
+        && get(lead).data.sales_rep_id == uid() && get(lead).data.status != 'Closed'
+        && getAfter(lead).data.status == 'Closed' && existsAfter(client)
+        && math.abs(c.amount - getAfter(client).data.retainer_amount * rate()) <= 0.005;
+    }
+
+    // ---- hour logs: append-only; developers read/write only their own ----------
+    match /maintenance_logs/{logId} {
+      allow read: if isAdmin() || (isDev() && resource.data.developer_id == uid());
+      allow create: if (isAdmin() || isDev())
+        && request.resource.data.developer_id == uid()
+        && request.resource.data.hours_spent is number
+        && request.resource.data.hours_spent > 0 && request.resource.data.hours_spent <= 24;
+      allow update, delete: if false;
+    }
+
+    // ---- maintenance documents (PDFs / links), per client ---------------------
+    // visibility 'team' = admin + developers; 'admin' = admin only (e.g. contracts, invoices).
+    // Query as a developer with where('visibility', '==', 'team').
+    match /client_docs/{docId} {
+      allow read: if isAdmin() || (isDev() && resource.data.visibility == 'team');
+      allow create: if (isAdmin() || isDev())
+        && request.resource.data.uploaded_by == uid()
+        && request.resource.data.kind in ['link', 'file']
+        && request.resource.data.visibility in ['team', 'admin']
+        && (isAdmin() || request.resource.data.visibility == 'team')
+        && request.resource.data.title is string && request.resource.data.title.size() <= 120
+        && (request.resource.data.kind == 'file'
+            || (request.resource.data.url is string && request.resource.data.url.matches('https://.*')));
+      allow update: if false;
+      allow delete: if isAdmin();
+    }
+    // Small PDFs are stored as base64 text (Firebase Storage needs a paid plan).
+    match /doc_files/{docId} {
+      allow read: if isAdmin() || (isDev() && get(col('client_docs', docId)).data.visibility == 'team');
+      allow create: if (isAdmin() || isDev())
+        && existsAfter(col('client_docs', docId))
+        && getAfter(col('client_docs', docId)).data.uploaded_by == uid()
+        && request.resource.data.data is string && request.resource.data.data.size() < 900000;
+      allow update: if false;
+      allow delete: if isAdmin();
+    }
+
+    match /{document=**} { allow read, write: if false; }
+  }
+}
