@@ -10,14 +10,17 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 const scr = (n) => 'SCR ' + Number(n || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
 const ROLE_LABEL = { admin: 'Admin', sales_associate: 'Sales associate', developer: 'Developer' };
 const STATUSES = ['Prospect', 'Pitch Sent', 'Meeting', 'Closed', 'Lost'];
+const PAY_METHODS = [['Online transfer', 'Online transfer'], ['Cash', 'Cash']];
 
-// Link visibility only – the real enforcement is Firestore rules + Cloud Functions.
+// Link visibility only – the real enforcement is Firestore rules.
 const NAV = [
+  ['overview', 'Overview', ['admin']],
   ['pipeline', 'Lead pipeline', ['admin', 'sales_associate']],
   ['commissions', 'Commissions', ['admin', 'sales_associate']],
   ['plans', 'Maintenance plans', ['admin', 'sales_associate']],
   ['support', 'Site health & hours', ['admin', 'developer']],
-  ['clients', 'Clients & billing', ['admin']],
+  ['clients', 'Clients', ['admin']],
+  ['billing', 'Billing & payments', ['admin']],
   ['team', 'Team', ['admin']],
 ];
 let me = null; // { uid, name, email, role }
@@ -31,9 +34,35 @@ async function run(fn) {
 const ref = (...p) => doc(db, ...p);
 const now = () => new Date().toISOString();
 const r2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
-const nextMonth = () => { const d = new Date(); d.setUTCMonth(d.getUTCMonth() + 1); return d.toISOString().slice(0, 10); };
+// Local calendar dates (so the 1st of the month starts on the 1st where you are, not in UTC).
+const today = () => { const d = new Date(); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10); };
+const period = () => today().slice(0, 7); // e.g. 2026-11
+const nextFirst = () => { const [y, m] = today().split('-').map(Number); return new Date(Date.UTC(y, m, 1)).toISOString().slice(0, 10); };
+const addMonths = (iso, n) => { const d = new Date(iso + 'T00:00:00Z'); d.setUTCMonth(d.getUTCMonth() + n); return d.toISOString().slice(0, 10); };
+const daysBetween = (a, b) => Math.round((new Date(b + 'T00:00:00Z') - new Date(a + 'T00:00:00Z')) / 864e5);
 const list = async (q) => (await getDocs(q)).docs.map((d) => ({ id: d.id, ...d.data() }));
 const mine = (col, field) => (me.role === 'admin' ? collection(db, col) : query(collection(db, col), where(field, '==', me.uid)));
+
+const COLORS = { Paid: '#43d9c8', Due: '#f0c674', Overdue: '#ff8585', 'Not invoiced': '#9bb2bd' };
+const badge = (s) => `<span class="badge" style="color:${COLORS[s] || '#9bb2bd'}">${esc(s)}</span>`;
+const payState = (p) => (p.status === 'Paid' ? 'Paid' : today() > p.due_date ? 'Overdue' : 'Due');
+// Hours reset every month: if the stored month is old, this month's usage is 0 (no rollover).
+const usedNow = (c) => ((c.hours_period || period()) === period() ? Number(c.hours_used || 0) : 0);
+
+// Ready-to-paste messages (built when a page renders, copied with one click).
+const MSG = {};
+const SIGN = '\n\nAXIS Digital Engineering · +248 260 3277 · axisagency.co';
+const reminderText = (p, contact) => `Hi ${contact || p.client_name}, a friendly reminder that your AXIS website care payment of ${scr(p.amount)} for ${p.period} was due on ${p.due_date}. You can pay by online transfer or cash. Please let me know once it is done. Thank you!${SIGN}`;
+const confirmText = (c, plan) => `Hi ${c.contact_person}, welcome to AXIS Digital Engineering! This confirms your plan:\n\n${plan.name} at ${scr(c.retainer_amount)} per month, starting ${c.start_date || 'the next 1st'}.\n• Up to ${plan.included_hours ?? 0} developer hours per month (unused hours do not roll over)\n• Support response: ${plan.response || 'as per your plan sheet'}\n• Billing: invoiced on the 1st, payable by the 5th by online transfer or cash\n• Minimum commitment: ${plan.min_term_months || 3} months, then month to month with 30 days' notice\n\nPlease reply "Confirmed" to lock this in.${SIGN}`;
+async function copy(text) {
+  try { await navigator.clipboard.writeText(text); toast('Copied. Paste it into WhatsApp, SMS or email.'); }
+  catch { prompt('Copy this message:', text); }
+}
+const receiptHtml = (p) => `<!doctype html><meta charset="utf-8"><title>Receipt ${esc(p.receipt_no)}</title>
+<style>body{font:15px/1.6 system-ui,Segoe UI,Roboto,sans-serif;max-width:560px;margin:3rem auto;padding:0 1.25rem;color:#111}h1{font-size:1.3rem;letter-spacing:.14em;margin:0}small{color:#666}table{width:100%;border-collapse:collapse;margin:1.5rem 0}td{padding:.55rem 0;border-bottom:1px solid #ddd}td:last-child{text-align:right;font-weight:600}button{padding:.5rem 1rem;font:inherit;cursor:pointer}@media print{button{display:none}}</style>
+<h1>AXIS DIGITAL ENGINEERING</h1><small>+248 260 3277 · axisagency.co</small><h2>Payment receipt</h2>
+<table><tr><td>Receipt no.</td><td>${esc(p.receipt_no)}</td></tr><tr><td>Received from</td><td>${esc(p.client_name)}</td></tr><tr><td>For</td><td>Website care plan, ${esc(p.period)}</td></tr><tr><td>Amount</td><td>${scr(p.amount)}</td></tr><tr><td>Paid by</td><td>${esc(p.method)}</td></tr><tr><td>Date received</td><td>${esc(p.paid_on)}</td></tr></table>
+<p>Thank you for your payment.</p><button onclick="print()">Print or save as PDF</button>`;
 
 // Generic form dialog -> resolves with values or null.
 function ask(title, fields) {
@@ -51,6 +80,42 @@ function ask(title, fields) {
 
 /* ---------------------------------- views ---------------------------------- */
 const views = {
+  // Everything that needs attention, on one screen.
+  async overview() {
+    const per = period(), t = today();
+    const [clients, pays, ops] = await Promise.all([list(collection(db, 'clients')), list(collection(db, 'payments')), list(collection(db, 'client_ops'))]);
+    const contactOf = Object.fromEntries(clients.map((c) => [c.id, c.contact_person]));
+    const unpaid = pays.filter((p) => p.status !== 'Paid');
+    const overdue = unpaid.filter((p) => t > p.due_date).sort((a, b) => a.due_date.localeCompare(b.due_date));
+    const active = clients.filter((c) => (c.start_date || '0000').slice(0, 7) <= per);
+    const missing = active.filter((c) => !pays.some((p) => p.client_id === c.id && p.period === per));
+    const hot = ops.filter((o) => o.included_hours > 0 && usedNow(o) / o.included_hours >= 0.8);
+    const ending = clients.filter((c) => c.term_end_date && daysBetween(t, c.term_end_date) <= 45).sort((a, b) => a.term_end_date.localeCompare(b.term_end_date));
+    const noHealth = ops.filter((o) => ['uptime', 'backups', 'security'].some((k) => !(o.site_health || {})[k]));
+    const sum = (a) => a.reduce((s, p) => s + (p.amount || 0), 0);
+    const mrr = clients.reduce((s, c) => s + (c.retainer_amount || 0), 0);
+    const sec = (title, items, empty) => `<section class="col"><b>${title} <span class="muted" style="display:inline">${items.length}</span></b>${items.join('') || `<span class="muted">${empty}</span>`}</section>`;
+
+    const overdueItems = overdue.map((p) => { MSG['rem:' + p.id] = reminderText(p, contactOf[p.client_id]);
+      return `<div class="card"><b>${esc(p.client_name)}</b><span class="muted">${scr(p.amount)} · ${p.period} · ${daysBetween(p.due_date, t)} day(s) late</span>
+        <div class="row" style="justify-content:flex-start"><button data-act="copy" data-id="rem:${p.id}">Copy reminder</button><button class="primary" data-act="mark-paid" data-id="${p.id}">Mark paid</button></div></div>`; });
+    const missingItems = missing.map((c) => `<div class="card"><b>${esc(c.company_name)}</b><span class="muted">${scr(c.retainer_amount)} · not invoiced for ${per}</span></div>`);
+    if (missing.length) missingItems.push(`<button class="primary" data-act="gen-invoices">Create ${per} invoices</button>`);
+    const hotItems = hot.map((o) => { const pct = Math.min(100, (usedNow(o) / o.included_hours) * 100);
+      return `<div class="card"><b>${esc(o.company_name)}</b><span class="muted">${usedNow(o)} / ${o.included_hours} hours used this month</span><div class="bar"><i class="${usedNow(o) > o.included_hours ? 'over' : ''}" style="width:${pct}%"></i></div></div>`; });
+    const endingItems = ending.map((c) => { const d = daysBetween(t, c.term_end_date);
+      return `<div class="card"><b>${esc(c.company_name)}</b><span class="muted">${d >= 0 ? `Minimum term ends in ${d} day(s) (${c.term_end_date})` : `Minimum term ended ${-d} day(s) ago. They can cancel with 30 days' notice.`}</span></div>`; });
+    const healthItems = noHealth.map((o) => `<div class="card"><b>${esc(o.company_name)}</b><span class="muted">Not confirmed: ${['uptime', 'backups', 'security'].filter((k) => !(o.site_health || {})[k]).join(', ')}</span></div>`);
+
+    $('#main').innerHTML = `<h2>Overview</h2>
+      <div class="stats"><div><b>${scr(mrr)}</b><span class="muted">Monthly recurring revenue</span></div><div><b>${scr(sum(pays.filter((p) => p.status === 'Paid' && p.period === per)))}</b><span class="muted">Collected in ${per}</span></div>
+      <div><b>${scr(sum(unpaid))}</b><span class="muted">Outstanding</span></div><div><b>${clients.length}</b><span class="muted">Clients</span></div></div>
+      <div class="cards" style="grid-template-columns:repeat(auto-fit,minmax(300px,1fr))">
+      ${sec('Overdue payments', overdueItems, 'Nobody is overdue.')}${sec('Not invoiced yet', missingItems, `Everyone is invoiced for ${per}.`)}
+      ${sec('Hours almost used up', hotItems, 'No client is near their monthly hours.')}${sec('Minimum terms ending (45 days)', endingItems, 'No terms ending soon.')}
+      ${sec('Site health not confirmed', healthItems, 'All health checks are confirmed.')}</div>`;
+  },
+
   async pipeline() {
     const leads = await list(mine('leads', 'sales_rep_id'));
     $('#main').innerHTML = `<div class="toolbar"><h2>Lead pipeline</h2><button class="primary" data-act="new-lead">New lead</button></div>
@@ -77,32 +142,58 @@ const views = {
 
   async plans() {
     const [plans, clients] = await Promise.all([list(collection(db, 'plans')), me.role === 'admin' ? list(collection(db, 'clients')) : null]); // linked clients are billing data: admin only
-    $('#main').innerHTML = `<div class="toolbar"><h2>Maintenance plans</h2>${me.role === 'admin' ? '<button class="primary" data-act="new-plan">Add plan</button>' : ''}</div><div class="cards">${plans.map((p) => `<article class="plan"><h3>${esc(p.name)}</h3>
-      <b style="font-size:1.4rem">${scr(p.price_monthly)}<span class="muted" style="display:inline"> / month</span></b><span>${p.included_hours} included hours</span>
+    const admin = me.role === 'admin';
+    $('#main').innerHTML = `<div class="toolbar"><h2>Maintenance plans</h2><div class="row">${admin && !plans.length ? '<button data-act="seed-plans">Load AXIS plans</button>' : ''}${admin ? '<button class="primary" data-act="new-plan">Add plan</button>' : ''}</div></div><div class="cards">${plans.sort((a, b) => a.price_monthly - b.price_monthly).map((p) => `<article class="plan"><h3>${esc(p.name)}</h3>
+      <b style="font-size:1.4rem">${scr(p.price_monthly)}<span class="muted" style="display:inline"> / month</span></b><span>${p.included_hours} developer hours / month (no rollover)</span>
+      ${p.response ? `<span class="muted">Response: ${esc(p.response)}</span>` : ''}${p.min_term_months ? `<span class="muted">Minimum term: ${p.min_term_months} months</span>` : ''}
       <ul>${(p.features || []).map((f) => `<li>${esc(f)}</li>`).join('')}</ul>
-      ${clients ? `<span class="muted">${clients.filter((c) => c.plan_id === p.id).map((c) => esc(c.company_name)).join(', ') || 'No linked clients'}</span>` : ''}${me.role === 'admin' ? `<div class="row" style="justify-content:flex-start"><button data-act="edit-plan" data-id="${p.id}">Edit</button><button data-act="del-plan" data-id="${p.id}">Delete</button></div>` : ''}</article>`).join('') || '<p class="muted">No plans yet. Admins can create them with the Add plan button.</p>'}</div>`;
+      ${clients ? `<span class="muted">${clients.filter((c) => c.plan_id === p.id).map((c) => esc(c.company_name)).join(', ') || 'No linked clients'}</span>` : ''}${admin ? `<div class="row" style="justify-content:flex-start"><button data-act="edit-plan" data-id="${p.id}">Edit</button><button data-act="del-plan" data-id="${p.id}">Delete</button></div>` : ''}</article>`).join('') || '<p class="muted">No plans yet. Admins can load the AXIS plans or add one.</p>'}</div>`;
   },
 
   async support() {
     const rows = await list(collection(db, 'client_ops'));
-    $('#main').innerHTML = `<h2>Site health & hours</h2><div class="wrap"><table><tr><th>Client</th><th>Plan</th><th>Hours</th><th>Uptime</th><th>Backups</th><th>Security</th><th></th></tr>${rows.map((c) => {
-      const pct = Math.min(100, (c.hours_used / (c.included_hours || 1)) * 100);
+    $('#main').innerHTML = `<h2>Site health & hours</h2><span class="muted" style="margin:-.75rem 0 1rem">Hours reset on the 1st of every month. Unused hours do not roll over.</span><div class="wrap"><table><tr><th>Client</th><th>Plan</th><th>Hours this month</th><th>Uptime</th><th>Backups</th><th>Security</th><th></th></tr>${rows.map((c) => {
+      const used = usedNow(c), pct = Math.min(100, (used / (c.included_hours || 1)) * 100);
       return `<tr><td>${esc(c.company_name)}</td><td>${esc(c.plan_name)}</td>
-        <td>${c.hours_used} / ${c.included_hours}<div class="bar"><i class="${c.hours_used > c.included_hours ? 'over' : ''}" style="width:${pct}%"></i></div></td>
-        ${['uptime', 'backups', 'security'].map((k) => `<td><input type="checkbox" style="width:auto" aria-label="${k} for ${esc(c.company_name)}" data-act="health" data-id="${c.id}" data-key="${k}" ${c.site_health[k] ? 'checked' : ''}></td>`).join('')}
+        <td>${used} / ${c.included_hours}<div class="bar"><i class="${used > c.included_hours ? 'over' : ''}" style="width:${pct}%"></i></div></td>
+        ${['uptime', 'backups', 'security'].map((k) => `<td><input type="checkbox" style="width:auto" aria-label="${k} for ${esc(c.company_name)}" data-act="health" data-id="${c.id}" data-key="${k}" ${(c.site_health || {})[k] ? 'checked' : ''}></td>`).join('')}
         <td><button data-act="hours" data-id="${c.id}">Log hours</button> <button data-act="docs" data-id="${c.id}">Documents</button></td></tr>`; }).join('') || '<tr><td colspan="7" class="muted">No clients yet.</td></tr>'}</table></div>`;
   },
 
   async clients() {
-    const [clients, plans] = await Promise.all([list(collection(db, 'clients')), list(collection(db, 'plans'))]);
-    const planName = Object.fromEntries(plans.map((p) => [p.id, p.name]));
+    const [clients, plans, pays] = await Promise.all([list(collection(db, 'clients')), list(collection(db, 'plans')), list(collection(db, 'payments'))]);
+    const planById = Object.fromEntries(plans.map((p) => [p.id, p]));
+    const per = period();
     const mrr = clients.reduce((s, c) => s + (c.retainer_amount || 0), 0);
-    window.__plans = plans;
-    $('#main').innerHTML = `<div class="toolbar"><h2>Clients & billing</h2><button class="primary" data-act="new-client">Add client</button></div>
-      <div class="stats"><div><b>${scr(mrr)}</b><span class="muted">Monthly recurring revenue</span></div><div><b>${clients.filter((c) => c.payment_status === 'Overdue').length}</b><span class="muted">Overdue</span></div><div><b>${clients.length}</b><span class="muted">Clients</span></div></div>
-      <div class="wrap"><table><tr><th>Company</th><th>Plan</th><th>Retainer</th><th>Renews</th><th>Payment</th><th></th></tr>${clients.map((c) => `
-      <tr><td>${esc(c.company_name)}<span class="muted">${esc(c.email)}</span></td><td>${esc(planName[c.plan_id] || c.plan_id)}</td><td>${scr(c.retainer_amount)}</td><td>${esc(c.next_renewal_date)}</td>
-      <td><select data-act="pay-status" data-id="${c.id}">${['Paid', 'Pending', 'Overdue'].map((s) => `<option ${s === c.payment_status ? 'selected' : ''}>${s}</option>`).join('')}</select></td><td><button data-act="docs" data-id="${c.id}">Documents</button></td></tr>`).join('') || '<tr><td colspan="6" class="muted">No clients yet.</td></tr>'}</table></div>`;
+    const stateOf = (c) => { const mineP = pays.filter((p) => p.client_id === c.id), cur = mineP.find((p) => p.period === per);
+      return mineP.some((p) => payState(p) === 'Overdue') ? 'Overdue' : cur ? payState(cur) : 'Not invoiced'; };
+    const states = clients.map(stateOf);
+    $('#main').innerHTML = `<div class="toolbar"><h2>Clients</h2><button class="primary" data-act="new-client">Add client</button></div>
+      <div class="stats"><div><b>${scr(mrr)}</b><span class="muted">Monthly recurring revenue</span></div><div><b>${states.filter((s) => s === 'Overdue').length}</b><span class="muted">Overdue</span></div><div><b>${clients.length}</b><span class="muted">Clients</span></div></div>
+      <div class="wrap"><table><tr><th>Company</th><th>Plan</th><th>Retainer</th><th>Pays by</th><th>Term ends</th><th>${per}</th><th></th></tr>${clients.map((c, i) => {
+        const plan = planById[c.plan_id] || { name: c.plan_id || 'your plan', included_hours: 0 };
+        MSG['conf:' + c.id] = confirmText(c, plan);
+        return `<tr><td>${esc(c.company_name)}<span class="muted">${esc(c.contact_person)} · ${esc(c.email)}</span></td><td>${esc(plan.name)}</td><td>${scr(c.retainer_amount)}</td><td>${esc(c.pay_method || 'Online transfer')}</td><td>${esc(c.term_end_date || '—')}</td>
+        <td>${badge(states[i])}</td><td><button data-act="copy" data-id="conf:${c.id}">Copy confirmation</button> <button data-act="docs" data-id="${c.id}">Documents</button></td></tr>`; }).join('') || '<tr><td colspan="7" class="muted">No clients yet.</td></tr>'}</table></div>`;
+  },
+
+  async billing() {
+    const [clients, pays] = await Promise.all([list(collection(db, 'clients')), list(collection(db, 'payments'))]);
+    const per = period();
+    const contactOf = Object.fromEntries(clients.map((c) => [c.id, c.contact_person]));
+    const sum = (a) => a.reduce((s, p) => s + (p.amount || 0), 0);
+    const unpaid = pays.filter((p) => p.status !== 'Paid');
+    const rows = [...pays].sort((a, b) => (a.status === 'Paid') - (b.status === 'Paid') || b.period.localeCompare(a.period) || a.client_name.localeCompare(b.client_name)).slice(0, 80);
+    $('#main').innerHTML = `<div class="toolbar"><h2>Billing & payments</h2><button class="primary" data-act="gen-invoices">Create ${per} invoices</button></div>
+      <span class="muted" style="margin:-.75rem 0 1rem">Invoices go out on the 1st and are due on the 5th. Payment by online transfer or cash.</span>
+      <div class="stats"><div><b>${scr(sum(pays.filter((p) => p.status === 'Paid' && p.period === per)))}</b><span class="muted">Collected in ${per}</span></div><div><b>${scr(sum(unpaid))}</b><span class="muted">Outstanding</span></div>
+      <div><b>${unpaid.filter((p) => today() > p.due_date).length}</b><span class="muted">Overdue</span></div></div>
+      <div class="wrap"><table><tr><th>Client</th><th>Month</th><th>Amount</th><th>Due</th><th>Status</th><th>Paid by</th><th></th></tr>${rows.map((p) => {
+        if (p.status !== 'Paid') MSG['rem:' + p.id] = reminderText(p, contactOf[p.client_id]);
+        return `<tr><td>${esc(p.client_name)}</td><td>${p.period}</td><td>${scr(p.amount)}</td><td>${p.due_date}</td><td>${badge(payState(p))}</td>
+        <td>${p.status === 'Paid' ? `${esc(p.method)}<span class="muted">${esc(p.paid_on)} · ${esc(p.receipt_no)}</span>` : '<span class="muted">—</span>'}</td>
+        <td>${p.status === 'Paid' ? `<button data-act="receipt" data-id="${p.id}">Receipt</button>` : `<button class="primary" data-act="mark-paid" data-id="${p.id}">Mark paid</button> <button data-act="copy" data-id="rem:${p.id}">Copy reminder</button>`}</td></tr>`; }).join('')
+        || `<tr><td colspan="7" class="muted">No invoices yet. Press "Create ${per} invoices" on the 1st of each month.</td></tr>`}</table></div>`;
   },
 };
 
@@ -179,17 +270,33 @@ async function openDocs(clientId) {
 }
 
 const planFields = (p = {}) => [
-  { name: 'name', label: 'Plan name (e.g. Tier 1: Core)', value: p.name },
+  { name: 'name', label: 'Plan name (e.g. Core Performance & Care Plan)', value: p.name },
   { name: 'price_monthly', label: 'Price per month (SCR)', type: 'number', value: p.price_monthly },
-  { name: 'included_hours', label: 'Included hours per month', type: 'number', value: p.included_hours },
+  { name: 'included_hours', label: 'Developer hours per month', type: 'number', value: p.included_hours },
+  { name: 'response', label: 'Support response (e.g. 24-hour turnaround on critical fixes)', value: p.response, opt: true },
+  { name: 'min_term_months', label: 'Minimum term (months)', type: 'number', value: p.min_term_months ?? 3 },
   { name: 'features', label: 'Features (separate with commas)', value: (p.features || []).join(', ') },
 ];
+const SEED_PLANS = [
+  { id: 'starter', name: 'Starter Care Plan', price_monthly: 5000, included_hours: 2, response: '48-72 hours by email or ticket (no emergency guarantee)', min_term_months: 6,
+    features: ['24/7 uptime and performance monitoring', 'Daily off-site cloud backups', 'Weekly CMS plugin and security patches', 'SSL + firewall + malware protection', 'Quarterly site health summary'] },
+  { id: 'core', name: 'Core Performance & Care Plan', price_monthly: 10000, included_hours: 4, response: '24-hour turnaround on critical fixes', min_term_months: 3,
+    features: ['24/7 uptime monitoring with a sub-2-second speed target', 'Daily off-site backups with emergency restoration', 'Weekly CMS plugin and security patches', 'SSL + firewall + malware protection', 'Monthly executive analytics and health PDF', 'Priority support'] },
+  { id: 'enterprise', name: 'Enterprise Growth & Managed Engineering', price_monthly: 15000, included_hours: 8, response: '2-4 hour emergency response', min_term_months: 3,
+    features: ['Everything in Core', 'Active CRO and technical SEO', 'Feature builds and landing pages', 'Monthly 30-minute CTO strategy call', 'Emergency response in 2-4 hours'] },
+];
+async function seedPlans() {
+  const b = writeBatch(db);
+  SEED_PLANS.forEach((p) => b.set(ref('plans', p.id), p));
+  await run(() => b.commit());
+  toast('AXIS plans loaded: Starter, Core and Enterprise.');
+}
 async function ensurePlans() {
   let plans = await list(collection(db, 'plans'));
   if (!plans.length) {
     if (me.role !== 'admin') { toast('No plans yet. Ask an admin to add one.'); return []; }
-    toast('No plans yet. Create your first one.');
-    await actions['new-plan']();
+    if (confirm('No plans yet. Load the three AXIS plans (Starter, Core, Enterprise)?')) await seedPlans();
+    else { toast('No plans yet. Create your first one.'); await actions['new-plan'](); }
     plans = await list(collection(db, 'plans'));
   }
   return plans;
@@ -197,11 +304,14 @@ async function ensurePlans() {
 function planData(id, f) {
   const price = Number(f.price_monthly), hours = Number(f.included_hours);
   if (!(price >= 0) || !(hours >= 0)) { toast('Price and hours must be numbers.'); throw new Error('invalid plan'); }
-  return { id, name: f.name.trim(), price_monthly: price, included_hours: hours, features: f.features.split(',').map((x) => x.trim()).filter(Boolean) };
+  return { id, name: f.name.trim(), price_monthly: price, included_hours: hours, response: (f.response || '').trim(), min_term_months: Number(f.min_term_months) || 3,
+    features: f.features.split(',').map((x) => x.trim()).filter(Boolean) };
 }
 
 const actions = {
   async docs(el) { await openDocs(el.dataset.id); },
+  async copy(el) { await copy(MSG[el.dataset.id] || ''); },
+  async 'seed-plans'() { if (confirm('Load the three AXIS plans (Starter, Core, Enterprise)?')) await seedPlans(); },
   async 'new-plan'() {
     const f = await ask('Add plan', planFields());
     if (!f) return;
@@ -242,7 +352,8 @@ const actions = {
     const f = await ask('Close deal', [
       { name: 'planId', label: 'Maintenance plan', options: plans.map((p) => [p.id, `${p.name} (${scr(p.price_monthly)})`]) },
       ...(me.role === 'admin' ? [{ name: 'retainerAmount', label: 'Custom monthly retainer (SCR, optional)', type: 'number', opt: true }] : []),
-      { name: 'contactEmail', label: 'Client email', type: 'email' }]);
+      { name: 'contactEmail', label: 'Client email', type: 'email' },
+      { name: 'pay_method', label: 'Client pays by', options: PAY_METHODS }]);
     if (!f) return;
     const plan = plans.find((p) => p.id === f.planId);
     const retainer = me.role === 'admin' && f.retainerAmount ? Number(f.retainerAmount) : plan.price_monthly; // sales close at list price
@@ -252,15 +363,17 @@ const actions = {
     const rep = (await getDoc(repRef)).data() || {};
     const cRef = doc(collection(db, 'clients'));
     const t = now(), health = { uptime: false, backups: false, security: false };
+    const start = nextFirst(); // every plan starts billing on the 1st
     const b = writeBatch(db);
     b.update(ref('leads', id), { status: 'Closed', closed_at: t, updated_at: t, client_id: cRef.id });
     b.set(cRef, { id: cRef.id, lead_id: id, company_name: lead.company_name, contact_person: lead.contact_person, email: f.contactEmail.trim(), plan_id: plan.id,
-      retainer_amount: retainer, next_renewal_date: nextMonth(), payment_status: 'Pending', hours_used: 0, site_health: health, created_at: t, updated_at: t });
-    b.set(ref('client_ops', cRef.id), { id: cRef.id, company_name: lead.company_name, plan_id: plan.id, plan_name: plan.name, included_hours: plan.included_hours, hours_used: 0, site_health: health, updated_at: t });
+      retainer_amount: retainer, start_date: start, next_renewal_date: start, term_end_date: addMonths(start, plan.min_term_months || 3), pay_method: f.pay_method,
+      payment_status: 'Pending', hours_used: 0, site_health: health, created_at: t, updated_at: t });
+    b.set(ref('client_ops', cRef.id), { id: cRef.id, company_name: lead.company_name, plan_id: plan.id, plan_name: plan.name, included_hours: plan.included_hours, hours_used: 0, hours_period: period(), site_health: health, updated_at: t });
     b.set(ref('commissions', id), { id, lead_id: id, sales_rep_id: lead.sales_rep_id, amount, status: 'Unpaid', created_at: t });
     b.update(repRef, { pending_commission: r2((rep.pending_commission || 0) + amount), last_commission_id: id });
     await run(() => b.commit());
-    toast(`Deal closed. Commission booked: ${scr(amount)}`);
+    toast(`Deal closed. Commission booked: ${scr(amount)}. Billing starts ${start}.`);
   },
 
   async pay(el) {
@@ -274,9 +387,53 @@ const actions = {
     await run(() => b.commit());
   },
 
-  async 'pay-status'(el) { await run(() => updateDoc(ref('clients', el.dataset.id), { payment_status: el.value, updated_at: now() })); },
+  // Invoices: one per client per month, created on (or after) the 1st, due on the 5th.
+  async 'gen-invoices'() {
+    const [clients, pays] = await Promise.all([list(collection(db, 'clients')), list(collection(db, 'payments'))]);
+    const per = period(), have = new Set(pays.filter((p) => p.period === per).map((p) => p.client_id));
+    const todo = clients.filter((c) => !have.has(c.id) && (c.retainer_amount || 0) > 0 && (c.start_date || '0000').slice(0, 7) <= per);
+    if (!todo.length) return toast(`Everyone is already invoiced for ${per}.`);
+    const b = writeBatch(db), t = now();
+    todo.forEach((c) => {
+      const id = `${c.id}_${per}`;
+      b.set(ref('payments', id), { id, client_id: c.id, client_name: c.company_name, period: per, amount: c.retainer_amount, due_date: `${per}-05`, status: 'Invoiced', method: '', receipt_no: '', created_at: t });
+      b.update(ref('clients', c.id), { payment_status: 'Pending', updated_at: t });
+    });
+    await run(() => b.commit());
+    toast(`${todo.length} invoice(s) created for ${per}. Due ${per}-05.`);
+  },
+
+  async 'mark-paid'(el) {
+    const [pSnap, pays] = await Promise.all([getDoc(ref('payments', el.dataset.id)), list(collection(db, 'payments'))]);
+    const p = pSnap.data();
+    const cl = (await getDoc(ref('clients', p.client_id))).data() || {};
+    const methods = cl.pay_method === 'Cash' ? [...PAY_METHODS].reverse() : PAY_METHODS;
+    const f = await ask(`Record payment: ${p.client_name} (${scr(p.amount)})`, [{ name: 'method', label: 'Paid by', options: methods }, { name: 'paid_on', label: 'Date received', type: 'date', value: today() }]);
+    if (!f) return;
+    const pref = `R-${f.paid_on.slice(0, 7).replace('-', '')}-`;
+    const receipt = pref + String(pays.filter((x) => (x.receipt_no || '').startsWith(pref)).length + 1).padStart(3, '0');
+    const stillOwing = pays.some((x) => x.client_id === p.client_id && x.id !== p.id && x.status !== 'Paid');
+    const b = writeBatch(db);
+    b.update(ref('payments', p.id), { status: 'Paid', method: f.method, paid_on: f.paid_on, paid_at: now(), receipt_no: receipt });
+    b.update(ref('clients', p.client_id), { payment_status: stillOwing ? 'Overdue' : 'Paid', updated_at: now() });
+    await run(() => b.commit());
+    toast(`Payment recorded. Receipt ${receipt}.`);
+  },
+
+  async receipt(el) {
+    const w = window.open('', '_blank'); // opened first so pop-up blockers allow it
+    if (!w) return toast('Allow pop-ups to open the receipt.');
+    w.opener = null;
+    try {
+      const p = (await getDoc(ref('payments', el.dataset.id))).data();
+      w.document.write(receiptHtml(p));
+      w.document.close();
+    } catch { w.close(); toast('Could not open that receipt.'); }
+  },
+
   async health(el) { await run(() => updateDoc(ref('client_ops', el.dataset.id), { [`site_health.${el.dataset.key}`]: el.checked, updated_at: now() })); },
 
+  // Hours reset each month: the first log of a new month starts the counter again.
   async hours(el) {
     const f = await ask('Log maintenance hours', [{ name: 'hoursSpent', label: 'Hours (steps of 0.25)', type: 'number' }, { name: 'description', label: 'What did you do?' }]);
     if (!f) return;
@@ -284,27 +441,34 @@ const actions = {
     if (!(h > 0 && h <= 24 && h % 0.25 === 0)) return toast('Log hours between 0.25 and 24, in steps of 0.25.');
     const oRef = ref('client_ops', el.dataset.id);
     const o = (await getDoc(oRef)).data();
+    const per = period(), rolled = !!o.hours_period && o.hours_period !== per;
+    const used = rolled ? h : (o.hours_used || 0) + h;
     const lRef = doc(collection(db, 'maintenance_logs'));
     const b = writeBatch(db);
-    b.set(lRef, { id: lRef.id, client_id: el.dataset.id, developer_id: me.uid, hours_spent: h, description: f.description.trim(), date: now().slice(0, 10) });
-    b.update(oRef, { hours_used: o.hours_used + h, last_log_id: lRef.id, updated_at: now() });
+    b.set(lRef, { id: lRef.id, client_id: el.dataset.id, developer_id: me.uid, hours_spent: h, description: f.description.trim(), date: today() });
+    b.update(oRef, { hours_used: used, hours_period: per, last_log_id: lRef.id, updated_at: now() });
     await run(() => b.commit());
-    toast(`Logged. ${o.hours_used + h} of ${o.included_hours} hours used.`);
+    toast(`Logged. ${used} of ${o.included_hours} hours used this month.`);
   },
 
   async 'new-client'() {
     const plans = await ensurePlans();
     if (!plans.length) return;
     const f = await ask('Add client', [{ name: 'company_name', label: 'Company' }, { name: 'contact_person', label: 'Contact person' }, { name: 'email', label: 'Email', type: 'email' },
-      { name: 'plan_id', label: 'Plan', options: plans.map((p) => [p.id, p.name]) }, { name: 'retainer_amount', label: 'Monthly retainer (SCR)', type: 'number' }, { name: 'next_renewal_date', label: 'Next renewal', type: 'date' }]);
+      { name: 'plan_id', label: 'Plan', options: plans.map((p) => [p.id, `${p.name} (${scr(p.price_monthly)})`]) },
+      { name: 'retainer_amount', label: 'Monthly retainer (SCR) - leave blank for the plan price', type: 'number', opt: true },
+      { name: 'start_date', label: 'First billing date (the 1st)', type: 'date', value: nextFirst() },
+      { name: 'pay_method', label: 'Client pays by', options: PAY_METHODS }]);
     if (!f) return;
     const plan = plans.find((p) => p.id === f.plan_id);
+    const retainer = f.retainer_amount ? Number(f.retainer_amount) : plan.price_monthly;
     const cRef = doc(collection(db, 'clients'));
     const t = now(), health = { uptime: false, backups: false, security: false };
     const b = writeBatch(db);
-    b.set(cRef, { id: cRef.id, company_name: f.company_name.trim(), contact_person: f.contact_person.trim(), email: f.email.trim(), plan_id: plan.id, retainer_amount: Number(f.retainer_amount),
-      next_renewal_date: f.next_renewal_date, payment_status: 'Pending', hours_used: 0, site_health: health, created_at: t, updated_at: t });
-    b.set(ref('client_ops', cRef.id), { id: cRef.id, company_name: f.company_name.trim(), plan_id: plan.id, plan_name: plan.name, included_hours: plan.included_hours, hours_used: 0, site_health: health, updated_at: t });
+    b.set(cRef, { id: cRef.id, company_name: f.company_name.trim(), contact_person: f.contact_person.trim(), email: f.email.trim(), plan_id: plan.id, retainer_amount: retainer,
+      start_date: f.start_date, next_renewal_date: f.start_date, term_end_date: addMonths(f.start_date, plan.min_term_months || 3), pay_method: f.pay_method,
+      payment_status: 'Pending', hours_used: 0, site_health: health, created_at: t, updated_at: t });
+    b.set(ref('client_ops', cRef.id), { id: cRef.id, company_name: f.company_name.trim(), plan_id: plan.id, plan_name: plan.name, included_hours: plan.included_hours, hours_used: 0, hours_period: period(), site_health: health, updated_at: t });
     await run(() => b.commit());
   },
 
@@ -317,18 +481,19 @@ const actions = {
   async 'set-role'(el) { await run(() => updateDoc(ref('users', el.dataset.id), { role: el.value })); },
 };
 
+const NO_REFRESH = new Set(['copy', 'receipt']);
 document.addEventListener('click', async (e) => {
   const el = e.target.closest('[data-act]');
   if (!el || ['SELECT', 'INPUT'].includes(el.tagName)) return;
   if (el.disabled) return;
   el.disabled = true; // no double-clicks while a write is in flight
-  try { await actions[el.dataset.act](el); await render(); } catch { /* toast already shown */ } finally { el.disabled = false; }
+  try { await actions[el.dataset.act](el); if (!NO_REFRESH.has(el.dataset.act)) await render(); } catch { /* toast already shown */ } finally { el.disabled = false; }
 });
 document.addEventListener('change', async (e) => {
   const el = e.target.closest('[data-act]');
   if (!el) return;
   // The control already shows the new value, so skip the refetch unless the write failed.
-  try { await actions[el.dataset.act](el); if (!['pay-status', 'health', 'set-role'].includes(el.dataset.act)) await render(); } catch { await render(); }
+  try { await actions[el.dataset.act](el); if (!['health', 'set-role'].includes(el.dataset.act)) await render(); } catch { await render(); }
 });
 
 /* ---------------------------------- shell ---------------------------------- */
