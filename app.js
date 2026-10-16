@@ -48,12 +48,14 @@ const badge = (s) => `<span class="badge" style="color:${COLORS[s] || '#9bb2bd'}
 const payState = (p) => (p.status === 'Paid' ? 'Paid' : today() > p.due_date ? 'Overdue' : 'Due');
 // Hours reset every month: if the stored month is old, this month's usage is 0 (no rollover).
 const usedNow = (c) => ((c.hours_period || period()) === period() ? Number(c.hours_used || 0) : 0);
+// A client's monthly fee always comes from their plan (falls back to the stored amount if the plan was deleted).
+const priceOf = (c, planById) => planById[c.plan_id]?.price_monthly ?? c.retainer_amount ?? 0;
 
 // Ready-to-paste messages (built when a page renders, copied with one click).
 const MSG = {};
 const SIGN = '\n\nAXIS Digital Engineering · +248 260 3277 · axisagency.co';
 const reminderText = (p, contact) => `Hi ${contact || p.client_name}, a friendly reminder that your AXIS website care payment of ${scr(p.amount)} for ${p.period} was due on ${p.due_date}. You can pay by online transfer or cash. Please let me know once it is done. Thank you!${SIGN}`;
-const confirmText = (c, plan) => `Hi ${c.contact_person}, welcome to AXIS Digital Engineering! This confirms your plan:\n\n${plan.name} at ${scr(c.retainer_amount)} per month, starting ${c.start_date || 'the next 1st'}.\n• Up to ${plan.included_hours ?? 0} developer hours per month (unused hours do not roll over)\n• Support response: ${plan.response || 'as per your plan sheet'}\n• Billing: invoiced on the 1st, payable by the 5th by online transfer or cash\n• Minimum commitment: ${plan.min_term_months || 3} months, then month to month with 30 days' notice\n\nPlease reply "Confirmed" to lock this in.${SIGN}`;
+const confirmText = (c, plan) => `Hi ${c.contact_person}, welcome to AXIS Digital Engineering! This confirms your plan:\n\n${plan.name} at ${scr(plan.price_monthly ?? c.retainer_amount)} per month, starting ${c.start_date || 'the next 1st'}.\n• Up to ${plan.included_hours ?? 0} developer hours per month (unused hours do not roll over)\n• Support response: ${plan.response || 'as per your plan sheet'}\n• Billing: invoiced on the 1st, payable by the 5th by online transfer or cash\n• Minimum commitment: ${plan.min_term_months || 3} months, then month to month with 30 days' notice\n\nPlease reply "Confirmed" to lock this in.${SIGN}`;
 async function copy(text) {
   try { await navigator.clipboard.writeText(text); toast('Copied. Paste it into WhatsApp, SMS or email.'); }
   catch { prompt('Copy this message:', text); }
@@ -83,7 +85,8 @@ const views = {
   // Everything that needs attention, on one screen.
   async overview() {
     const per = period(), t = today();
-    const [clients, pays, ops] = await Promise.all([list(collection(db, 'clients')), list(collection(db, 'payments')), list(collection(db, 'client_ops'))]);
+    const [clients, pays, ops, plans] = await Promise.all([list(collection(db, 'clients')), list(collection(db, 'payments')), list(collection(db, 'client_ops')), list(collection(db, 'plans'))]);
+    const planById = Object.fromEntries(plans.map((p) => [p.id, p]));
     const contactOf = Object.fromEntries(clients.map((c) => [c.id, c.contact_person]));
     const unpaid = pays.filter((p) => p.status !== 'Paid');
     const overdue = unpaid.filter((p) => t > p.due_date).sort((a, b) => a.due_date.localeCompare(b.due_date));
@@ -93,13 +96,13 @@ const views = {
     const ending = clients.filter((c) => c.term_end_date && daysBetween(t, c.term_end_date) <= 45).sort((a, b) => a.term_end_date.localeCompare(b.term_end_date));
     const noHealth = ops.filter((o) => ['uptime', 'backups', 'security'].some((k) => !(o.site_health || {})[k]));
     const sum = (a) => a.reduce((s, p) => s + (p.amount || 0), 0);
-    const mrr = clients.reduce((s, c) => s + (c.retainer_amount || 0), 0);
+    const mrr = clients.reduce((s, c) => s + priceOf(c, planById), 0);
     const sec = (title, items, empty) => `<section class="col"><b>${title} <span class="muted" style="display:inline">${items.length}</span></b>${items.join('') || `<span class="muted">${empty}</span>`}</section>`;
 
     const overdueItems = overdue.map((p) => { MSG['rem:' + p.id] = reminderText(p, contactOf[p.client_id]);
       return `<div class="card"><b>${esc(p.client_name)}</b><span class="muted">${scr(p.amount)} · ${p.period} · ${daysBetween(p.due_date, t)} day(s) late</span>
         <div class="row" style="justify-content:flex-start"><button data-act="copy" data-id="rem:${p.id}">Copy reminder</button><button class="primary" data-act="mark-paid" data-id="${p.id}">Mark paid</button></div></div>`; });
-    const missingItems = missing.map((c) => `<div class="card"><b>${esc(c.company_name)}</b><span class="muted">${scr(c.retainer_amount)} · not invoiced for ${per}</span></div>`);
+    const missingItems = missing.map((c) => `<div class="card"><b>${esc(c.company_name)}</b><span class="muted">${scr(priceOf(c, planById))} · not invoiced for ${per}</span></div>`);
     if (missing.length) missingItems.push(`<button class="primary" data-act="gen-invoices">Create ${per} invoices</button>`);
     const hotItems = hot.map((o) => { const pct = Math.min(100, (usedNow(o) / o.included_hours) * 100);
       return `<div class="card"><b>${esc(o.company_name)}</b><span class="muted">${usedNow(o)} / ${o.included_hours} hours used this month</span><div class="bar"><i class="${usedNow(o) > o.included_hours ? 'over' : ''}" style="width:${pct}%"></i></div></div>`; });
@@ -164,17 +167,17 @@ const views = {
     const [clients, plans, pays] = await Promise.all([list(collection(db, 'clients')), list(collection(db, 'plans')), list(collection(db, 'payments'))]);
     const planById = Object.fromEntries(plans.map((p) => [p.id, p]));
     const per = period();
-    const mrr = clients.reduce((s, c) => s + (c.retainer_amount || 0), 0);
+    const mrr = clients.reduce((s, c) => s + priceOf(c, planById), 0);
     const stateOf = (c) => { const mineP = pays.filter((p) => p.client_id === c.id), cur = mineP.find((p) => p.period === per);
       return mineP.some((p) => payState(p) === 'Overdue') ? 'Overdue' : cur ? payState(cur) : 'Not invoiced'; };
     const states = clients.map(stateOf);
     $('#main').innerHTML = `<div class="toolbar"><h2>Clients</h2><button class="primary" data-act="new-client">Add client</button></div>
       <div class="stats"><div><b>${scr(mrr)}</b><span class="muted">Monthly recurring revenue</span></div><div><b>${states.filter((s) => s === 'Overdue').length}</b><span class="muted">Overdue</span></div><div><b>${clients.length}</b><span class="muted">Clients</span></div></div>
-      <div class="wrap"><table><tr><th>Company</th><th>Plan</th><th>Retainer</th><th>Pays by</th><th>Term ends</th><th>${per}</th><th></th></tr>${clients.map((c, i) => {
+      <div class="wrap"><table><tr><th>Company</th><th>Plan</th><th>Monthly fee</th><th>Pays by</th><th>Term ends</th><th>${per}</th><th></th></tr>${clients.map((c, i) => {
         const plan = planById[c.plan_id] || { name: c.plan_id || 'your plan', included_hours: 0 };
         MSG['conf:' + c.id] = confirmText(c, plan);
-        return `<tr><td>${esc(c.company_name)}<span class="muted">${esc(c.contact_person)} · ${esc(c.email)}</span></td><td>${esc(plan.name)}</td><td>${scr(c.retainer_amount)}</td><td>${esc(c.pay_method || 'Online transfer')}</td><td>${esc(c.term_end_date || '—')}</td>
-        <td>${badge(states[i])}</td><td><button data-act="copy" data-id="conf:${c.id}">Copy confirmation</button> <button data-act="docs" data-id="${c.id}">Documents</button></td></tr>`; }).join('') || '<tr><td colspan="7" class="muted">No clients yet.</td></tr>'}</table></div>`;
+        return `<tr><td>${esc(c.company_name)}<span class="muted">${esc(c.contact_person)} · ${esc(c.email)}</span></td><td>${esc(plan.name)}</td><td>${scr(priceOf(c, planById))}</td><td>${esc(c.pay_method || 'Online transfer')}</td><td>${esc(c.term_end_date || '—')}</td>
+        <td>${badge(states[i])}</td><td><button data-act="copy" data-id="conf:${c.id}">Copy confirmation</button> <button data-act="change-plan" data-id="${c.id}">Change plan</button> <button data-act="docs" data-id="${c.id}">Documents</button></td></tr>`; }).join('') || '<tr><td colspan="7" class="muted">No clients yet.</td></tr>'}</table></div>`;
   },
 
   async billing() {
@@ -319,266 +322,14 @@ const actions = {
     const data = planData(r.id, f);
     await run(() => setDoc(r, data));
   },
+  // Editing a plan updates every client on it (name, hours, and monthly fee) from the next invoice on.
   async 'edit-plan'(el) {
     const f = await ask('Edit plan', planFields((await getDoc(ref('plans', el.dataset.id))).data()));
     if (!f) return;
     const data = planData(el.dataset.id, f);
-    const linked = await getDocs(query(collection(db, 'client_ops'), where('plan_id', '==', el.dataset.id)));
-    const b = writeBatch(db);
-    b.set(ref('plans', el.dataset.id), data);
-    linked.docs.forEach((d) => b.update(d.ref, { plan_name: data.name, included_hours: data.included_hours, updated_at: now() }));
-    await run(() => b.commit());
-  },
-  async 'del-plan'(el) {
-    if (confirm('Delete this plan? Existing clients keep their records but lose the plan label.')) await run(() => deleteDoc(ref('plans', el.dataset.id)));
-  },
-  async 'new-lead'() {
-    const f = await ask('New lead', [{ name: 'company_name', label: 'Company' }, { name: 'contact_person', label: 'Contact person' }, { name: 'estimated_value', label: 'Estimated value (SCR)', type: 'number' },
-      ...(me.role === 'admin' ? [{ name: 'sales_rep_id', label: 'Sales associate user ID' }] : [])]);
-    if (!f) return;
-    const r = doc(collection(db, 'leads'));
-    await run(() => setDoc(r, { id: r.id, company_name: f.company_name.trim(), contact_person: f.contact_person.trim(), status: 'Prospect',
-      estimated_value: Number(f.estimated_value), sales_rep_id: me.role === 'admin' ? f.sales_rep_id.trim() : me.uid, created_at: now(), updated_at: now() }));
-  },
-  async move(el) { await run(() => updateDoc(ref('leads', el.dataset.id), { status: el.value, updated_at: now() })); },
-
-  // Closing = one atomic batch: lead -> Closed, client + client_ops, commission (retainer x rate), rep balance.
-  async close(el) {
-    const id = el.dataset.id;
-    const plans = await ensurePlans();
-    if (!plans.length) return;
-    const [settings, leadSnap] = await Promise.all([getDoc(ref('settings', 'agency')), getDoc(ref('leads', id))]);
-    const lead = leadSnap.data();
-    const f = await ask('Close deal', [
-      { name: 'planId', label: 'Maintenance plan', options: plans.map((p) => [p.id, `${p.name} (${scr(p.price_monthly)})`]) },
-      ...(me.role === 'admin' ? [{ name: 'retainerAmount', label: 'Custom monthly retainer (SCR, optional)', type: 'number', opt: true }] : []),
-      { name: 'contactEmail', label: 'Client email', type: 'email' },
-      { name: 'pay_method', label: 'Client pays by', options: PAY_METHODS }]);
-    if (!f) return;
-    const plan = plans.find((p) => p.id === f.planId);
-    const retainer = me.role === 'admin' && f.retainerAmount ? Number(f.retainerAmount) : plan.price_monthly; // sales close at list price
-    const rate = settings.exists() ? Number(settings.data().commission_rate ?? 0.1) : 0.1;
-    const amount = r2(retainer * rate);
-    const repRef = ref('users', lead.sales_rep_id);
-    const rep = (await getDoc(repRef)).data() || {};
-    const cRef = doc(collection(db, 'clients'));
-    const t = now(), health = { uptime: false, backups: false, security: false };
-    const start = nextFirst(); // every plan starts billing on the 1st
-    const b = writeBatch(db);
-    b.update(ref('leads', id), { status: 'Closed', closed_at: t, updated_at: t, client_id: cRef.id });
-    b.set(cRef, { id: cRef.id, lead_id: id, company_name: lead.company_name, contact_person: lead.contact_person, email: f.contactEmail.trim(), plan_id: plan.id,
-      retainer_amount: retainer, start_date: start, next_renewal_date: start, term_end_date: addMonths(start, plan.min_term_months || 3), pay_method: f.pay_method,
-      payment_status: 'Pending', hours_used: 0, site_health: health, created_at: t, updated_at: t });
-    b.set(ref('client_ops', cRef.id), { id: cRef.id, company_name: lead.company_name, plan_id: plan.id, plan_name: plan.name, included_hours: plan.included_hours, hours_used: 0, hours_period: period(), site_health: health, updated_at: t });
-    b.set(ref('commissions', id), { id, lead_id: id, sales_rep_id: lead.sales_rep_id, amount, status: 'Unpaid', created_at: t });
-    b.update(repRef, { pending_commission: r2((rep.pending_commission || 0) + amount), last_commission_id: id });
-    await run(() => b.commit());
-    toast(`Deal closed. Commission booked: ${scr(amount)}. Billing starts ${start}.`);
-  },
-
-  async pay(el) {
-    const cRef = ref('commissions', el.dataset.id);
-    const c = (await getDoc(cRef)).data();
-    const uRef = ref('users', c.sales_rep_id);
-    const u = (await getDoc(uRef)).data();
-    const b = writeBatch(db);
-    b.update(cRef, { status: 'Paid', paid_at: now() });
-    b.update(uRef, { pending_commission: r2((u.pending_commission || 0) - c.amount), total_earned: r2((u.total_earned || 0) + c.amount) });
-    await run(() => b.commit());
-  },
-
-  // Invoices: one per client per month, created on (or after) the 1st, due on the 5th.
-  async 'gen-invoices'() {
-    const [clients, pays] = await Promise.all([list(collection(db, 'clients')), list(collection(db, 'payments'))]);
-    const per = period(), have = new Set(pays.filter((p) => p.period === per).map((p) => p.client_id));
-    const todo = clients.filter((c) => !have.has(c.id) && (c.retainer_amount || 0) > 0 && (c.start_date || '0000').slice(0, 7) <= per);
-    if (!todo.length) return toast(`Everyone is already invoiced for ${per}.`);
+    const [linkedOps, linkedClients] = await Promise.all([
+      getDocs(query(collection(db, 'client_ops'), where('plan_id', '==', el.dataset.id))),
+      getDocs(query(collection(db, 'clients'), where('plan_id', '==', el.dataset.id)))]);
     const b = writeBatch(db), t = now();
-    todo.forEach((c) => {
-      const id = `${c.id}_${per}`;
-      b.set(ref('payments', id), { id, client_id: c.id, client_name: c.company_name, period: per, amount: c.retainer_amount, due_date: `${per}-05`, status: 'Invoiced', method: '', receipt_no: '', created_at: t });
-      b.update(ref('clients', c.id), { payment_status: 'Pending', updated_at: t });
-    });
-    await run(() => b.commit());
-    toast(`${todo.length} invoice(s) created for ${per}. Due ${per}-05.`);
-  },
-
-  async 'mark-paid'(el) {
-    const [pSnap, pays] = await Promise.all([getDoc(ref('payments', el.dataset.id)), list(collection(db, 'payments'))]);
-    const p = pSnap.data();
-    const cl = (await getDoc(ref('clients', p.client_id))).data() || {};
-    const methods = cl.pay_method === 'Cash' ? [...PAY_METHODS].reverse() : PAY_METHODS;
-    const f = await ask(`Record payment: ${p.client_name} (${scr(p.amount)})`, [{ name: 'method', label: 'Paid by', options: methods }, { name: 'paid_on', label: 'Date received', type: 'date', value: today() }]);
-    if (!f) return;
-    const pref = `R-${f.paid_on.slice(0, 7).replace('-', '')}-`;
-    const receipt = pref + String(pays.filter((x) => (x.receipt_no || '').startsWith(pref)).length + 1).padStart(3, '0');
-    const stillOwing = pays.some((x) => x.client_id === p.client_id && x.id !== p.id && x.status !== 'Paid');
-    const b = writeBatch(db);
-    b.update(ref('payments', p.id), { status: 'Paid', method: f.method, paid_on: f.paid_on, paid_at: now(), receipt_no: receipt });
-    b.update(ref('clients', p.client_id), { payment_status: stillOwing ? 'Overdue' : 'Paid', updated_at: now() });
-    await run(() => b.commit());
-    toast(`Payment recorded. Receipt ${receipt}.`);
-  },
-
-  async receipt(el) {
-    const w = window.open('', '_blank'); // opened first so pop-up blockers allow it
-    if (!w) return toast('Allow pop-ups to open the receipt.');
-    w.opener = null;
-    try {
-      const p = (await getDoc(ref('payments', el.dataset.id))).data();
-      w.document.write(receiptHtml(p));
-      w.document.close();
-    } catch { w.close(); toast('Could not open that receipt.'); }
-  },
-
-  async health(el) { await run(() => updateDoc(ref('client_ops', el.dataset.id), { [`site_health.${el.dataset.key}`]: el.checked, updated_at: now() })); },
-
-  // Hours reset each month: the first log of a new month starts the counter again.
-  async hours(el) {
-    const f = await ask('Log maintenance hours', [{ name: 'hoursSpent', label: 'Hours (steps of 0.25)', type: 'number' }, { name: 'description', label: 'What did you do?' }]);
-    if (!f) return;
-    const h = Number(f.hoursSpent);
-    if (!(h > 0 && h <= 24 && h % 0.25 === 0)) return toast('Log hours between 0.25 and 24, in steps of 0.25.');
-    const oRef = ref('client_ops', el.dataset.id);
-    const o = (await getDoc(oRef)).data();
-    const per = period(), rolled = !!o.hours_period && o.hours_period !== per;
-    const used = rolled ? h : (o.hours_used || 0) + h;
-    const lRef = doc(collection(db, 'maintenance_logs'));
-    const b = writeBatch(db);
-    b.set(lRef, { id: lRef.id, client_id: el.dataset.id, developer_id: me.uid, hours_spent: h, description: f.description.trim(), date: today() });
-    b.update(oRef, { hours_used: used, hours_period: per, last_log_id: lRef.id, updated_at: now() });
-    await run(() => b.commit());
-    toast(`Logged. ${used} of ${o.included_hours} hours used this month.`);
-  },
-
-  async 'new-client'() {
-    const plans = await ensurePlans();
-    if (!plans.length) return;
-    const f = await ask('Add client', [{ name: 'company_name', label: 'Company' }, { name: 'contact_person', label: 'Contact person' }, { name: 'email', label: 'Email', type: 'email' },
-      { name: 'plan_id', label: 'Plan', options: plans.map((p) => [p.id, `${p.name} (${scr(p.price_monthly)})`]) },
-      { name: 'retainer_amount', label: 'Monthly retainer (SCR) - leave blank for the plan price', type: 'number', opt: true },
-      { name: 'start_date', label: 'First billing date (the 1st)', type: 'date', value: nextFirst() },
-      { name: 'pay_method', label: 'Client pays by', options: PAY_METHODS }]);
-    if (!f) return;
-    const plan = plans.find((p) => p.id === f.plan_id);
-    const retainer = f.retainer_amount ? Number(f.retainer_amount) : plan.price_monthly;
-    const cRef = doc(collection(db, 'clients'));
-    const t = now(), health = { uptime: false, backups: false, security: false };
-    const b = writeBatch(db);
-    b.set(cRef, { id: cRef.id, company_name: f.company_name.trim(), contact_person: f.contact_person.trim(), email: f.email.trim(), plan_id: plan.id, retainer_amount: retainer,
-      start_date: f.start_date, next_renewal_date: f.start_date, term_end_date: addMonths(f.start_date, plan.min_term_months || 3), pay_method: f.pay_method,
-      payment_status: 'Pending', hours_used: 0, site_health: health, created_at: t, updated_at: t });
-    b.set(ref('client_ops', cRef.id), { id: cRef.id, company_name: f.company_name.trim(), plan_id: plan.id, plan_name: plan.name, included_hours: plan.included_hours, hours_used: 0, hours_period: period(), site_health: health, updated_at: t });
-    await run(() => b.commit());
-  },
-
-  async 'new-member'() {
-    const f = await ask('Add team member (create their login in Firebase Authentication first)', [{ name: 'uid', label: 'User ID (UID from Authentication)' }, { name: 'name', label: 'Name' }, { name: 'email', label: 'Email', type: 'email' },
-      { name: 'role', label: 'Role', options: Object.entries(ROLE_LABEL) }]);
-    if (!f) return;
-    await run(() => setDoc(ref('users', f.uid.trim()), { id: f.uid.trim(), name: f.name.trim(), email: f.email.trim(), role: f.role, pending_commission: 0, total_earned: 0 }));
-  },
-  async 'set-role'(el) { await run(() => updateDoc(ref('users', el.dataset.id), { role: el.value })); },
-};
-
-const NO_REFRESH = new Set(['copy', 'receipt']);
-document.addEventListener('click', async (e) => {
-  const el = e.target.closest('[data-act]');
-  if (!el || ['SELECT', 'INPUT'].includes(el.tagName)) return;
-  if (el.disabled) return;
-  el.disabled = true; // no double-clicks while a write is in flight
-  try { await actions[el.dataset.act](el); if (!NO_REFRESH.has(el.dataset.act)) await render(); } catch { /* toast already shown */ } finally { el.disabled = false; }
-});
-document.addEventListener('change', async (e) => {
-  const el = e.target.closest('[data-act]');
-  if (!el) return;
-  // The control already shows the new value, so skip the refetch unless the write failed.
-  try { await actions[el.dataset.act](el); if (!['health', 'set-role'].includes(el.dataset.act)) await render(); } catch { await render(); }
-});
-
-/* ---------------------------------- shell ---------------------------------- */
-const SKELETON = '<div class="skel" style="width:40%;height:2rem"></div><div class="skel" style="height:8rem;margin-top:1rem"></div><div class="skel" style="height:14rem;margin-top:1rem"></div>';
-async function render(skeleton = false) {
-  const allowed = NAV.filter((n) => n[2].includes(me.role));
-  const route = location.hash.slice(1);
-  const current = allowed.find((n) => n[0] === route) || allowed[0];
-  $('#nav').innerHTML = allowed.map((n) => `<a href="#${n[0]}" ${n === current ? 'aria-current="page"' : ''}>${n[1]}</a>`).join('');
-  if (skeleton) $('#main').innerHTML = SKELETON;
-  try { await views[current[0]](); }
-  catch (e) { console.error(e); $('#main').innerHTML = '<p class="muted">Could not load this page. Check your connection and try again.</p>'; }
-}
-window.addEventListener('hashchange', () => me && render(true));
-
-$('#login').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  $('#login-error').textContent = '';
-  try {
-    if (signupMode) { window.__signupName = $('#name').value; await createUserWithEmailAndPassword(auth, $('#email').value, $('#password').value); }
-    else await signInWithEmailAndPassword(auth, $('#email').value, $('#password').value);
-  }
-  catch (err) {
-    const code = err.code || '';
-    $('#login-error').textContent =
-      code === 'auth/invalid-credential' || code === 'auth/wrong-password' || code === 'auth/user-not-found' ? 'Email or password is incorrect.'
-      : code === 'auth/api-key-not-valid.-please-pass-a-valid-api-key.' || code === 'auth/invalid-api-key' ? 'Firebase config is missing or wrong. Check firebase-config.js.'
-      : code === 'auth/email-already-in-use' ? 'That email already has an account. Sign in instead.'
-      : code === 'auth/weak-password' ? 'Choose a password with at least 6 characters.'
-      : code === 'auth/unauthorized-domain' ? 'This domain is not authorized in Firebase Authentication settings.'
-      : code === 'auth/operation-not-allowed' ? 'Email/Password sign-in is not enabled in Firebase.'
-      : `Sign-in failed (${code || 'unknown error'}).`;
-  }
-});
-$('#signout').addEventListener('click', () => signOut(auth));
-
-let signupMode = false;
-$('#mode-toggle').addEventListener('click', () => {
-  signupMode = !signupMode;
-  $('#name-row').classList.toggle('hidden', !signupMode);
-  $('#name').required = signupMode;
-  $('#login-btn').textContent = signupMode ? 'Create account' : 'Sign in';
-  $('#mode-toggle').textContent = signupMode ? 'I already have an account' : 'Create an account';
-  $('#login-error').textContent = '';
-});
-
-// First account ever becomes admin (and closes that door with settings/bootstrap).
-// Everyone after that is created as "pending" until an admin assigns a role on the Team page.
-async function createProfile(user) {
-  const base = { id: user.uid, name: (window.__signupName || user.displayName || user.email.split('@')[0]).trim(), email: user.email, pending_commission: 0, total_earned: 0 };
-  const marker = ref('settings', 'bootstrap');
-  const first = !(await getDoc(marker)).exists();
-  if (first) {
-    try {
-      const b = writeBatch(db);
-      b.set(marker, { claimed_by: user.uid, at: now() });
-      b.set(ref('users', user.uid), { ...base, role: 'admin' });
-      await b.commit();
-      return { ...base, role: 'admin' };
-    } catch { /* someone else claimed it first: fall through to pending */ }
-  }
-  await setDoc(ref('users', user.uid), { ...base, role: 'pending' });
-  return { ...base, role: 'pending' };
-}
-// Existing admins close the first-admin door the next time they sign in.
-async function ensureBootstrapMarker() {
-  const marker = ref('settings', 'bootstrap');
-  if (!(await getDoc(marker)).exists()) await setDoc(marker, { claimed_by: me.uid, at: now() }).catch(() => {});
-}
-
-onAuthStateChanged(auth, async (user) => {
-  me = null;
-  $('#shell').classList.toggle('hidden', !user);
-  $('#login').classList.toggle('hidden', !!user);
-  if (!user) return;
-  let profile = (await getDoc(ref('users', user.uid))).data();
-  if (!profile) profile = await createProfile(user);
-  if (!ROLE_LABEL[profile.role]) {
-    await signOut(auth);
-    $('#login-error').textContent = 'Account created. An admin has to approve it and assign your role. Try again after they have.';
-    return;
-  }
-  me = { uid: user.uid, name: profile.name || user.email.split('@')[0], email: user.email, role: profile.role };
-  $('#who').textContent = me.name; $('#who-email').textContent = me.email;
-  $('#role').textContent = ROLE_LABEL[me.role]; $('#role').className = `badge ${me.role}`;
-  if (me.role === 'admin') ensureBootstrapMarker();
-  render(true);
-});
+    b.set(ref('plans', el.dataset.id), data);
+    linkedOps.docs.forEach((d) => b.update(d.ref, { plan_name: data.name, included_hours:
